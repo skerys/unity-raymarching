@@ -4,9 +4,10 @@ using UnityEngine;
 
 public class SDFObject : MonoBehaviour
 {
-    public enum SDFType {Sphere, Box, Torus};
+    public enum SDFType {Sphere, Box, Torus, Mandelbulb, Juliabulb};
     public enum CombineOperation {Add, SmoothAdd, Cut, Mask};
     public enum ModifierType {None, Elongate, Round, Onion, Repetition, Displacement, Twist}
+    public enum TextureMappingType{Cylindrical, Triplanar, Biplanar}
 
     public SDFType shapeType;
     public CombineOperation combineOperation;
@@ -17,6 +18,11 @@ public class SDFObject : MonoBehaviour
     [Range(0,1)]
     public float blendFactor;
     public float smoothness;
+
+    public TextureMappingType textureMappingType;
+    public Texture2D texture;
+    public int textureID = -1;
+
 
     [HideInInspector]
     public int childrenCount;
@@ -46,7 +52,7 @@ public class SDFObject : MonoBehaviour
                 Gizmos.DrawWireSphere(transform.position, transform.lossyScale.x);
                 break;
             case SDFType.Box:
-                Gizmos.DrawWireCube(transform.position, transform.lossyScale);
+                Gizmos.DrawWireCube(transform.position, transform.lossyScale * 2.0f);
                 break;
             case SDFType.Torus:
                 Gizmos.DrawWireSphere(transform.position, transform.lossyScale.x + transform.lossyScale.y);

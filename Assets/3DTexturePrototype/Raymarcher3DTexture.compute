@@ -1,0 +1,498 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+static const float MAX_DIST = 500;
+static const float epsilon = 0.001f;
+static const float shadowBias = epsilon * 50;
+
+Texture2D<float4> Source;
+
+RWTexture2D<float4> Result;
+
+Texture3D<float4> volumeTexture;
+
+SamplerState MyLinearRepeatSampler;
+
+float4x4 CameraToWorldMatrix;
+float4x4 CameraInverseProjectionMatrix;
+
+float3 AmbientColor;
+
+struct Ray{
+    float3 origin;
+    float3 dir;
+};
+
+struct Object{
+    float3 position;
+    float3 scale;
+    float3 diffuseColor;
+    int objType;
+    int combineOp;
+    
+    float blendFactor;
+    float smoothness;
+    int childrenCount;
+    int modifierType;
+    float3 modifierVar1;
+};
+
+struct SceneInfo{
+    float distance;
+    float3 diffuseColor;
+    float smoothness;
+
+    float3 objectPosition;
+};
+
+struct Light{
+    float3 position;
+    float3 intensity;
+    int isDirectional;
+};
+StructuredBuffer<Light> lights;
+int numLights;
+
+StructuredBuffer<Object> objects;
+int numObjects;
+
+Ray CreateRay(float3 origin, float3 direction){
+    Ray ray;
+    ray.origin = origin;
+    ray.dir = direction;
+    return ray;
+}
+
+Ray CreateRayFromCamera(float2 uv){
+    float3 origin = mul(CameraToWorldMatrix, float4(0,0,0,1)).xyz;
+    float3 dir = mul(CameraInverseProjectionMatrix, float4(uv,0,1)).xyz;
+    dir = mul(CameraToWorldMatrix, float4(dir, 0)).xyz;
+    dir = normalize(dir);
+    return CreateRay(origin, dir);
+}
+
+float SphereSDF(float3 samplePoint, float3 center, float radius)
+{
+    return distance(samplePoint, center) - radius;
+}
+
+float BoxSDF(float3 samplePoint, float3 center, float3 scale)
+{
+    float3 o = abs(samplePoint - center) - scale;
+    float ud = length(max(o,0));
+    float n = max(max(min(o.x,0),min(o.y,0)), min(o.z, 0));
+    return ud+n;
+}
+
+float TorusSDF(float3 samplePoint, float3 center, float r1, float r2)
+{
+    float2 q = float2(length((samplePoint-center).xz)-r1,samplePoint.y-center.y);
+    return length(q)-r2;
+}
+
+float MandelbulbSDF(float3 p)
+{
+	float3 w = p;
+    float m = dot(w, w);
+
+	float dz = 1.0;
+        
+	for(int i = 0; i < 15; i++)
+    {
+        dz = 8 * pow(sqrt(m), 7.0)*dz + 1.0;
+        float r = length(w);
+        float b = 8 * acos(w.y / r);
+        float a = 8 * atan2(w.x, w.z);
+        w = p + pow(r, 8) * float3(sin(b) * sin(a), cos(b), sin(b) * cos(a));
+
+        m = dot(w, w);
+		if(m > 256.0)
+            break;
+    }
+    return 0.25*log(m)*sqrt(m)/dz;
+}
+
+float JuliabulbSDF(float3 pos, float4 c)
+{
+	float3 orbit = pos;
+    float dz = 1;
+    
+    for (int i = 0; i < 4; i++) 
+    {
+        float r = length(orbit);
+    	float o = acos(orbit.z/r);
+    	float p = atan(orbit.y/orbit.x);
+        
+        dz = 8*r*r*r*r*r*r*r*dz;
+        
+        r = r*r*r*r*r*r*r*r;
+        o = 8*o;
+        p = 8*p;
+        
+        orbit = float3(r*sin(o) * cos(p), 
+                r*sin(o) * sin(p), 
+                r*cos(o)) + c;
+        
+        if (dot(orbit, orbit) > 4.0) break;
+    }
+    float z = length(orbit);
+    return 0.5*z*log(z)/dz;
+}
+
+float3 ModifierElongate(float3 p, float3 h)
+{
+    float3 q = p - clamp(p, -h, h);
+    return q;
+}
+
+float glsl_mod(float x, float y)
+{
+    return x - y * floor(x/y);
+}
+
+float2 glsl_mod(float2 x, float2 y)
+{
+    return x - y * floor(x/y);
+}
+
+float3 glsl_mod(float3 x, float3 y)
+{
+    return x - y * floor(x/y);
+}
+
+float3 ModifierRepetition(float3 p, float3 c)
+{
+    float3 q = glsl_mod(p+0.5*c,c)-0.5*c;
+    return q;
+}
+
+float3 ModifierTwist(float3 p, float k)
+{
+    float c = cos(k*p.y);
+    float s = sin(k*p.y);
+    float2x2 m = float2x2(c, s, -s, c);
+    float3 q = float3(mul(m,p.xz), p.y);
+    return q;
+}
+
+float4 SmoothBlend(float a, float b, float3 colA, float3 colB, float k)
+{
+    float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
+    float blendDist = lerp(b, a, h) - k*h*(1.0-h);
+    float3 blendCol = lerp(colB, colA, h);
+
+    return float4(blendCol, blendDist);
+}
+
+float SmoothBlendOnlyDist(float a, float b, float k)
+{
+    float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
+    float blendDist = lerp(b, a, h) - k*h*(1.0-h);
+
+
+    return blendDist;
+}
+
+void Combine(inout SceneInfo infoA, SceneInfo infoB, int op, float blendFactor)
+{
+    float dist = infoA.distance;
+    float3 color = infoA.diffuseColor;
+    float smoothness = infoA.smoothness;
+    float3 objectPosition = infoA.objectPosition;
+
+    if(op == 0){
+        if(infoB.distance < infoA.distance){
+            dist = infoB.distance;
+            color = infoB.diffuseColor;
+            smoothness = infoB.smoothness;
+            objectPosition = infoB.objectPosition;
+        }
+    }
+    else if(op == 1){
+        float4 blend = SmoothBlend(infoA.distance, infoB.distance, infoA.diffuseColor, infoB.diffuseColor, blendFactor);
+        dist = blend.w;
+        color = blend.xyz;
+    }
+    else if(op == 2){
+        if(-infoB.distance > dist){
+            dist = -infoB.distance;
+            color = infoB.diffuseColor;
+            smoothness = infoB.smoothness;
+            objectPosition = infoB.objectPosition;
+        }
+    }
+    else if(op == 3){
+        if(infoB.distance > dist){
+            dist = infoB.distance;
+            color = infoB.diffuseColor;
+            smoothness = infoB.smoothness;
+            objectPosition = infoB.objectPosition;
+        }
+    }
+
+    infoA.distance = dist;
+    infoA.diffuseColor = color;
+    infoA.smoothness = smoothness;
+    infoA.objectPosition = objectPosition;
+}
+
+float CombineOnlyDist(float distA, float distB, int op, float blendFactor)
+{
+    float dist = distA;
+
+    if(op == 0){
+        if(distB < distA){
+            dist = distB;
+        }
+    }
+    else if(op == 1){
+        float4 blend = SmoothBlendOnlyDist(distA, distB, blendFactor);
+        dist = blend.w;
+    }
+    else if(op == 2){
+        if(-distB > dist){
+            dist = -distB;
+        }
+    }
+    else if(op == 3){
+        if(distB > dist){
+            dist = distB;
+        }
+    }
+    return dist;
+}
+
+float Displace(float3 p, float k)
+{
+    return sin(k*p.x) * sin(k*p.y) * sin(k*p.z);
+}
+
+float GetObjectDistance(Object obj, float3 samplePoint)
+{
+    float3 q = samplePoint - obj.position;
+    float dist = MAX_DIST;
+    if(obj.modifierType == 1)
+    {
+        q = ModifierElongate(q, obj.modifierVar1);
+    }
+    else if(obj.modifierType == 4)
+    {
+        q = ModifierRepetition(q, obj.modifierVar1);
+    }
+    else if(obj.modifierType == 6)
+    {
+        q = ModifierTwist(q, obj.modifierVar1.x);
+    }
+
+    q += obj.position;
+
+    if(obj.objType == 0){
+        dist = SphereSDF(q, obj.position, obj.scale.x);
+    }
+    else if(obj.objType == 1){
+        dist = BoxSDF(q, obj.position, obj.scale);
+    }
+    else if(obj.objType == 2){
+        dist = TorusSDF(q, obj.position, obj.scale.x, obj.scale.y);
+    }
+    else if(obj.objType == 3)
+    {
+        dist = MandelbulbSDF(q - obj.position);
+    }
+    else if(obj.objType == 4)
+    {
+        dist = JuliabulbSDF(q - obj.position, obj.scale.x);
+    }
+
+    if(obj.modifierType == 2)
+    {
+        dist -= obj.modifierVar1.x;
+    }
+    else if(obj.modifierType == 3)
+    {
+        dist = abs(dist) - obj.modifierVar1.x;
+    }
+    else if(obj.modifierType == 5)
+    {
+        dist += Displace(samplePoint - obj.position, obj.modifierVar1.x) * obj.modifierVar1.y;
+    }
+
+    return dist;
+}
+
+void RaymarchScene(float3 samplePoint, inout SceneInfo info)
+{
+    SceneInfo sceneInfo;
+    sceneInfo.distance = MAX_DIST;
+    sceneInfo.diffuseColor = 1;
+    sceneInfo.smoothness = 0;
+    sceneInfo.objectPosition = 0;
+
+    SceneInfo localInfo;
+    SceneInfo childInfo;
+    SceneInfo combinedInfo;
+
+    for(int i = 0; i < numObjects; ++i)
+    {
+        Object currObj = objects[i];
+        int childrenCount = currObj.childrenCount;
+
+        localInfo.distance = GetObjectDistance(currObj, samplePoint);
+        localInfo.diffuseColor = currObj.diffuseColor;
+        localInfo.smoothness = currObj.smoothness;
+        localInfo.objectPosition = currObj.position;
+
+        for(int j = 0; j < childrenCount; ++j)
+        {
+            Object childObj = objects[i+j+1];
+
+            childInfo.distance = GetObjectDistance(childObj, samplePoint);
+            childInfo.diffuseColor = childObj.diffuseColor;
+            childInfo.smoothness = childObj.smoothness;
+            childInfo.objectPosition = childObj.position;
+
+            Combine(localInfo, childInfo, childObj.combineOp, childObj.blendFactor);
+        }
+        
+        i += childrenCount;
+
+        Combine(sceneInfo, localInfo, currObj.combineOp, currObj.blendFactor);
+    }
+
+    info = sceneInfo;
+}
+
+float RaymarchSceneOnlyDist(float3 samplePoint)
+{
+    float sceneDist = MAX_DIST;
+
+    for(int i = 0; i < numObjects; ++i)
+    {
+        Object currObj = objects[i];
+        int childrenCount = currObj.childrenCount;
+
+        float localDist = GetObjectDistance(currObj, samplePoint);
+
+        for(int j = 0; j < childrenCount; ++j)
+        {
+            Object childObj = objects[i+j+1];
+            float childDist = GetObjectDistance(childObj, samplePoint);
+
+            localDist = CombineOnlyDist(localDist, childDist, childObj.combineOp, childObj.blendFactor);
+        } 
+        i += childrenCount;
+
+        sceneDist = CombineOnlyDist(sceneDist, localDist, currObj.combineOp, currObj.blendFactor);
+    }
+    return sceneDist;
+}
+
+float3 CalculateNormal(float3 p) {
+    float x = RaymarchSceneOnlyDist(float3(p.x+epsilon,p.y,p.z)) - RaymarchSceneOnlyDist(float3(p.x-epsilon,p.y,p.z));
+    float y = RaymarchSceneOnlyDist(float3(p.x,p.y+epsilon,p.z)) - RaymarchSceneOnlyDist(float3(p.x,p.y-epsilon,p.z));
+    float z = RaymarchSceneOnlyDist(float3(p.x,p.y,p.z+epsilon)) - RaymarchSceneOnlyDist(float3(p.x,p.y,p.z-epsilon));
+    return normalize(float3(x,y,z));
+}
+
+float CalculateShadow(Ray ray, float minDist, float maxDist)
+{
+    for(float t = minDist; t<maxDist;)
+    {
+        float h = RaymarchSceneOnlyDist(ray.origin + ray.dir * t);
+        if(h < epsilon)
+            return 0.0;
+        t+=h; 
+    }
+    return 1.0;
+    
+}
+
+float3 PhongContribution(float3 diffuse, float3 specular, float alpha, float3 p, float3 camPos, float3 lightPos, float3 lightIntensity)
+{
+    float3 N = CalculateNormal(p);
+    float3 L = normalize(lightPos - p);
+    float lightDist = length(L);
+    float3 V = normalize(camPos - p);
+    float3 R = normalize(reflect(-L, N));
+
+    float dotLN = dot(L, N);
+    float dotRV = dot(R, V);
+
+    Ray shadowRay;
+    shadowRay.origin = p;
+    shadowRay.dir = L;
+    float shadow = CalculateShadow(shadowRay, 0.03, length(lightPos - p));
+
+    if(dotLN < 0.0){
+        return float3(0,0,0);
+    }
+
+    if(dotRV < 0.0){
+        return shadow * lightIntensity * (diffuse * dotLN) / (lightDist + 0.5 * lightDist * lightDist);
+    }
+
+    return shadow * lightIntensity * (diffuse * dotLN + specular * pow(dotRV, alpha)) / (lightDist + 0.5 * lightDist * lightDist);
+}
+
+float3 PhongIllumination(float3 ambient, float3 diffuse, float3 specular, float alpha, float3 p, float3 camPos)
+{
+    float3 color = ambient * 0.5f;
+
+    for(int i = 0; i < numLights; ++i)
+    {
+        float3 lightPos = lights[i].isDirectional == 1 ?  p - lights[i].position : lights[i].position;
+        color += PhongContribution(diffuse, specular, alpha, p, camPos, lightPos, lights[i].intensity);
+    }
+
+    return color;
+}
+
+[numthreads(16,16,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint steps = 0;
+    float dist = 0;
+
+    Result[id.xy] = Source[id.xy];
+
+    uint width;
+    uint height;
+
+    Result.GetDimensions(width, height);
+
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+
+    Ray ray = CreateRayFromCamera(uv);
+    float3 camPos = ray.origin;
+    SceneInfo sceneInfo;
+
+    while(dist < MAX_DIST)
+    {
+        steps++;
+        RaymarchScene(ray.origin, sceneInfo);
+        float currentDist = sceneInfo.distance;
+
+        if(currentDist <= epsilon){
+            float3 hitPoint = ray.origin + ray.dir * currentDist;
+            float3 normal = CalculateNormal(hitPoint - ray.dir * epsilon);
+                   
+            float3 texturedDiffuse = volumeTexture.SampleLevel(MyLinearRepeatSampler, hitPoint, 0);
+            float3 color = PhongIllumination(AmbientColor, texturedDiffuse, float3(1,1,1), sceneInfo.smoothness, hitPoint, camPos);
+
+            // float3 offsetPos = hitPoint + normal * shadowBias;
+            // float3 dirToLight = (positionLight)?normalize(_Light - offsetPos):-_Light;
+
+            // ray.origin = offsetPos;
+            // ray.dir = dirToLight;
+
+            // float distToLight = (positionLight)?distance(offsetPos, _Light):MAX_DIST;
+            // float shadow = CalculateShadow(ray, distToLight);
+
+            //float3 dfield = float3(dist+currentDist, dist+currentDist, dist+currentDist) / 12.0;
+            //Result[id.xy] = float4(dfield, 1);
+            Result[id.xy] = float4(color, 1);
+            break;
+        }
+        ray.origin += ray.dir * (currentDist* 0.7);
+        dist += currentDist;
+    }
+}

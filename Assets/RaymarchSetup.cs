@@ -14,8 +14,11 @@ struct SDFObjectData
     public int modifierType;
     public Vector3 modifierVar1;
 
+    public int textureMappingType;
+    public int textureID;
+
     public static int GetSize(){
-        return sizeof(float) * 14 + sizeof(int) * 4;
+        return sizeof(float) * 14 + sizeof(int) * 6;
     }
 }
 
@@ -42,6 +45,9 @@ public class RaymarchSetup : MonoBehaviour
     Light lightObj;
     List<ComputeBuffer> buffers;
 
+    Texture2DArray textureArray;
+    
+
     void Initialize()
     {
         cam = Camera.current;
@@ -65,14 +71,15 @@ public class RaymarchSetup : MonoBehaviour
             targetRT.Create();
         }
 
+        SetupTextureArray();
         SetupSceneObjects();
         SetupLights();
 
         raymarcherShader.SetTexture(0, "Source", source);
         raymarcherShader.SetTexture(0, "Result", targetRT);
 
-        int threadGroupsX = Mathf.CeilToInt(cam.pixelWidth / 8.0f);
-        int threadGroupsY = Mathf.CeilToInt(cam.pixelHeight / 8.0f);
+        int threadGroupsX = Mathf.CeilToInt(cam.pixelWidth / 16.0f);
+        int threadGroupsY = Mathf.CeilToInt(cam.pixelHeight / 16.0f);
         raymarcherShader.Dispatch(0, threadGroupsX, threadGroupsY, 1);
 
         Graphics.Blit(targetRT, destination);
@@ -83,6 +90,55 @@ public class RaymarchSetup : MonoBehaviour
         }
     }
 
+    void SetupTextureArray()
+    {
+        List<SDFObject> sceneObjects = new List<SDFObject>(FindObjectsOfType<SDFObject>());
+
+        List<Texture2D> textures = new List<Texture2D>();
+        
+
+        Vector2Int maxSize = Vector2Int.zero;
+
+        for(int i = 0; i < sceneObjects.Count; i++)
+        {
+            var obj = sceneObjects[i];
+
+            //If object has no texture assigned, skip
+            if(!obj.texture) continue;
+
+            if(!textures.Contains(obj.texture))
+            {
+                textures.Add(obj.texture);
+
+                if(obj.texture.width > maxSize.x) maxSize.x = obj.texture.width;
+                if(obj.texture.height > maxSize.y) maxSize.y = obj.texture.height;
+
+                obj.textureID = textures.Count - 1;
+            }
+        }
+
+        //if there are no textures in the scene, still create a null texture array
+        int textureCount = textures.Count > 0 ? textures.Count : 1;
+
+        Vector2[] UVscales = new Vector2[textureCount];
+        Texture2DArray textureArray = new Texture2DArray(maxSize.x, maxSize.y, textureCount, TextureFormat.RGB24, false, false);
+
+        for(int i = 0; i < textures.Count; i++)
+        {
+            //Graphics.CopyTexture(textures[i], 0, textureArray, i);
+            Graphics.CopyTexture(textures[i], 0, 0, 0, 0, textures[i].width, textures[i].height, textureArray, i, 0, 0, 0);
+            UVscales[i] = new Vector2((float)textures[i].width / maxSize.x, (float)textures[i].height / maxSize.y);
+        }
+
+        ComputeBuffer textureUVranges = new ComputeBuffer(UVscales.Length, sizeof(float) * 2);
+        textureUVranges.SetData(UVscales);
+
+        raymarcherShader.SetBuffer(0, "textureUVranges", textureUVranges);
+        raymarcherShader.SetTexture(0, "textures", textureArray);
+
+        buffers.Add(textureUVranges);
+    } 
+ 
     void SetupSceneObjects()
     {
         List<SDFObject> sceneObjects = new List<SDFObject>(FindObjectsOfType<SDFObject>());
@@ -122,7 +178,9 @@ public class RaymarchSetup : MonoBehaviour
                 childrenCount = (int)obj.childrenCount,
                 smoothness = obj.smoothness,
                 modifierType = (int)obj.modifier,
-                modifierVar1 = obj.modifierVar
+                modifierVar1 = obj.modifierVar,
+                textureMappingType = (int)obj.textureMappingType,
+                textureID = obj.textureID
             };
         }
 

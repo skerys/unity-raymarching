@@ -8,13 +8,14 @@ Texture2D<float4> Source;
 
 RWTexture2D<float4> Result;
 
+StructuredBuffer<float2> textureUVranges;
+Texture2DArray<float4> textures;
+SamplerState MyLinearRepeatSampler;
 
 float4x4 CameraToWorldMatrix;
 float4x4 CameraInverseProjectionMatrix;
 
 float3 AmbientColor;
-
-
 
 struct Ray{
     float3 origin;
@@ -33,12 +34,19 @@ struct Object{
     int childrenCount;
     int modifierType;
     float3 modifierVar1;
+
+    int textureMappingType;
+    int textureID;
 };
 
 struct SceneInfo{
     float distance;
     float3 diffuseColor;
     float smoothness;
+
+    float3 objectPosition;
+    int mapType;
+    int textureID;
 };
 
 struct Light{
@@ -86,10 +94,69 @@ float TorusSDF(float3 samplePoint, float3 center, float r1, float r2)
     return length(q)-r2;
 }
 
+float MandelbulbSDF(float3 p)
+{
+	float3 w = p;
+    float m = dot(w, w);
+
+	float dz = 1.0;
+        
+	for(int i = 0; i < 15; i++)
+    {
+        dz = 8 * pow(sqrt(m), 7.0)*dz + 1.0;
+        float r = length(w);
+        float b = 8 * acos(w.y / r);
+        float a = 8 * atan2(w.x, w.z);
+        w = p + pow(r, 8) * float3(sin(b) * sin(a), cos(b), sin(b) * cos(a));
+
+        m = dot(w, w);
+		if(m > 256.0)
+            break;
+    }
+    return 0.25*log(m)*sqrt(m)/dz;
+}
+
+float JuliabulbSDF(float3 pos, float4 c)
+{
+	float3 orbit = pos;
+    float dz = 1;
+    
+    for (int i = 0; i < 4; i++) 
+    {
+        float r = length(orbit);
+    	float o = acos(orbit.z/r);
+    	float p = atan(orbit.y/orbit.x);
+        
+        dz = 8*r*r*r*r*r*r*r*dz;
+        
+        r = r*r*r*r*r*r*r*r;
+        o = 8*o;
+        p = 8*p;
+        
+        orbit = float3(r*sin(o) * cos(p), 
+                r*sin(o) * sin(p), 
+                r*cos(o)) + c;
+        
+        if (dot(orbit, orbit) > 4.0) break;
+    }
+    float z = length(orbit);
+    return 0.5*z*log(z)/dz;
+}
+
 float3 ModifierElongate(float3 p, float3 h)
 {
     float3 q = p - clamp(p, -h, h);
     return q;
+}
+
+float glsl_mod(float x, float y)
+{
+    return x - y * floor(x/y);
+}
+
+float2 glsl_mod(float2 x, float2 y)
+{
+    return x - y * floor(x/y);
 }
 
 float3 glsl_mod(float3 x, float3 y)
@@ -130,42 +197,58 @@ float SmoothBlendOnlyDist(float a, float b, float k)
     return blendDist;
 }
 
-void Combine(float distA, float distB, float3 colorA, float3 colorB, float smoothnessA, float smoothnessB, int op, float blendFactor, inout SceneInfo info)
+void Combine(inout SceneInfo infoA, SceneInfo infoB, int op, float blendFactor)
 {
-    float dist = distA;
-    float3 color = colorA;
-    float smoothness = smoothnessA;
+    float dist = infoA.distance;
+    float3 color = infoA.diffuseColor;
+    float smoothness = infoA.smoothness;
+    float3 objectPosition = infoA.objectPosition;
+    int textureID = infoA.textureID;
+    int mapType = infoA.mapType;
 
     if(op == 0){
-        if(distB < distA){
-            dist = distB;
-            color = colorB;
-            smoothness = smoothnessB;
+        if(infoB.distance < infoA.distance){
+            dist = infoB.distance;
+            color = infoB.diffuseColor;
+            smoothness = infoB.smoothness;
+            objectPosition = infoB.objectPosition;
+            textureID = infoB.textureID;
+            mapType = infoB.mapType;
         }
     }
     else if(op == 1){
-        float4 blend = SmoothBlend(distA, distB, colorA, colorB, blendFactor);
+        float4 blend = SmoothBlend(infoA.distance, infoB.distance, infoA.diffuseColor, infoB.diffuseColor, blendFactor);
         dist = blend.w;
         color = blend.xyz;
+        textureID = -1;
     }
     else if(op == 2){
-        if(-distB > dist){
-            dist = -distB;
-            color = colorB;
-            smoothness = smoothnessB;
+        if(-infoB.distance > dist){
+            dist = -infoB.distance;
+            color = infoB.diffuseColor;
+            smoothness = infoB.smoothness;
+            objectPosition = infoB.objectPosition;
+            textureID = infoB.textureID;
+            mapType = infoB.mapType;
         }
     }
     else if(op == 3){
-        if(distB > dist){
-            dist = distB;
-            color = colorB;
-            smoothness = smoothnessB;
+        if(infoB.distance > dist){
+            dist = infoB.distance;
+            color = infoB.diffuseColor;
+            smoothness = infoB.smoothness;
+            objectPosition = infoB.objectPosition;
+            textureID = infoB.textureID;
+            mapType = infoB.mapType;
         }
     }
 
-    info.distance = dist;
-    info.diffuseColor = color;
-    info.smoothness = smoothness;
+    infoA.distance = dist;
+    infoA.diffuseColor = color;
+    infoA.smoothness = smoothness;
+    infoA.objectPosition = objectPosition;
+    infoA.textureID = textureID;
+    infoA.mapType = mapType;
 }
 
 float CombineOnlyDist(float distA, float distB, int op, float blendFactor)
@@ -227,6 +310,14 @@ float GetObjectDistance(Object obj, float3 samplePoint)
     else if(obj.objType == 2){
         dist = TorusSDF(q, obj.position, obj.scale.x, obj.scale.y);
     }
+    else if(obj.objType == 3)
+    {
+        dist = MandelbulbSDF(q - obj.position);
+    }
+    else if(obj.objType == 4)
+    {
+        dist = JuliabulbSDF(q - obj.position, obj.scale.x);
+    }
 
     if(obj.modifierType == 2)
     {
@@ -246,10 +337,15 @@ float GetObjectDistance(Object obj, float3 samplePoint)
 
 void RaymarchScene(float3 samplePoint, inout SceneInfo info)
 {
-    float sceneDist = MAX_DIST;
-    float3 sceneColor = 1;
-    float sceneSmoothness = 0;
     SceneInfo sceneInfo;
+    sceneInfo.distance = MAX_DIST;
+    sceneInfo.diffuseColor = 1;
+    sceneInfo.smoothness = 0;
+    sceneInfo.objectPosition = 0;
+    sceneInfo.textureID = -1;
+
+    SceneInfo localInfo;
+    SceneInfo childInfo;
     SceneInfo combinedInfo;
 
     for(int i = 0; i < numObjects; ++i)
@@ -257,31 +353,33 @@ void RaymarchScene(float3 samplePoint, inout SceneInfo info)
         Object currObj = objects[i];
         int childrenCount = currObj.childrenCount;
 
-        float localDist = GetObjectDistance(currObj, samplePoint);
-        float3 localColor = currObj.diffuseColor;
-        float localSmoothness = currObj.smoothness;
+        localInfo.distance = GetObjectDistance(currObj, samplePoint);
+        localInfo.diffuseColor = currObj.diffuseColor;
+        localInfo.smoothness = currObj.smoothness;
+        localInfo.objectPosition = currObj.position;
+        localInfo.textureID = currObj.textureID;
+        localInfo.mapType = currObj.textureMappingType;
 
         for(int j = 0; j < childrenCount; ++j)
         {
             Object childObj = objects[i+j+1];
-            float childDist = GetObjectDistance(childObj, samplePoint);
 
-            Combine(localDist, childDist, localColor, childObj.diffuseColor, localSmoothness, childObj.smoothness, childObj.combineOp, childObj.blendFactor, combinedInfo);
-            localColor = combinedInfo.diffuseColor;
-            localDist = combinedInfo.distance;
-            localSmoothness = combinedInfo.smoothness;
+            childInfo.distance = GetObjectDistance(childObj, samplePoint);
+            childInfo.diffuseColor = childObj.diffuseColor;
+            childInfo.smoothness = childObj.smoothness;
+            childInfo.objectPosition = childObj.position;
+            childInfo.textureID = childObj.textureID;
+            childInfo.mapType = childObj.textureMappingType;
+
+            Combine(localInfo, childInfo, childObj.combineOp, childObj.blendFactor);
         }
         
         i += childrenCount;
 
-        Combine(sceneDist, localDist, sceneColor, localColor, sceneSmoothness, localSmoothness, currObj.combineOp, currObj.blendFactor, sceneInfo);
-        sceneColor = sceneInfo.diffuseColor;
-        sceneDist = sceneInfo.distance;
-        sceneSmoothness = sceneInfo.smoothness;
+        Combine(sceneInfo, localInfo, currObj.combineOp, currObj.blendFactor);
     }
-    info.diffuseColor = sceneColor;
-    info.distance = sceneDist;
-    info.smoothness = sceneSmoothness;
+
+    info = sceneInfo;
 }
 
 float RaymarchSceneOnlyDist(float3 samplePoint)
@@ -356,6 +454,106 @@ float3 PhongContribution(float3 diffuse, float3 specular, float alpha, float3 p,
     return shadow * lightIntensity * (diffuse * dotLN + specular * pow(dotRV, alpha)) / (lightDist + 0.5 * lightDist * lightDist);
 }
 
+float3 BoxMap(int textureID, float3 p, float k, float3 objectPosition)
+{
+    float3 obj_p = p - objectPosition;
+
+    float2 uvScale = textureUVranges[textureID];
+
+    float2 uvX = float2(obj_p.y, obj_p.z);
+    uvX = glsl_mod(uvX * uvScale, uvScale);
+    float3 x = textures.SampleLevel(MyLinearRepeatSampler, float3(uvX.x, uvX.y, (float)textureID), 0);
+    
+    float2 uvY = float2(obj_p.z, obj_p.x);
+    uvY = glsl_mod(uvY * uvScale, uvScale);
+    float3 y = textures.SampleLevel(MyLinearRepeatSampler, float3(uvY.x, uvY.y, (float)textureID), 0);
+
+    float2 uvZ = float2(obj_p.x, obj_p.y);
+    uvZ = glsl_mod(uvZ * uvScale, uvScale);
+    float3 z = textures.SampleLevel(MyLinearRepeatSampler, float3(uvZ.x, uvZ.y, (float)textureID), 0);
+
+    //Debug texture mapping
+    // x = float3(1.0,0.0,0.0);
+    // y = float3(0.0,1.0,0.0);
+    // z = float3(0.0,0.0,1.0);
+
+    float3 n =abs(CalculateNormal(p));
+
+    float3 w = pow(n, float3(k,k,k));
+
+    return (x*w.x + y* w.y + z * w.z) / (w.x + w.y + w.z);
+}
+
+float3 CylindricalMap(int textureID, float3 p)
+{
+    float2 uvScale = textureUVranges[textureID];
+    float2 uv = float2(atan2(p.z, p.x) / 6.2832f, (p.y - 1.0f) * 0.5f);
+    
+    uv = glsl_mod(uv * uvScale, uvScale);
+
+    return textures.SampleLevel(MyLinearRepeatSampler, float3(uv.x, uv.y, float(textureID)), 0);
+}
+
+float3 BiplanarMap(int textureID, float3 p, float k, float3 objectPosition)
+{
+    float3 obj_p = p - objectPosition;
+
+    float3 n = abs(CalculateNormal(p));
+    float2 uvScale = textureUVranges[textureID];
+
+    int3 ma = (n.x > n.y && n.x > n.z) ? int3(0, 1, 2) :
+              (n.y > n.z)              ? int3(1, 2, 0) :
+                                         int3(2, 0, 1) ;   
+
+    int3 mi = (n.x < n.y && n.x < n.z) ? int3(0, 1, 2) :
+              (n.y < n.z)              ? int3(1, 2, 0) :
+                                         int3(2, 0, 1) ;
+
+    int3 me = int3(3,3,3) - mi - ma;
+
+    float2 uvX = float2(obj_p[ma.y], obj_p[ma.z]);
+    uvX = glsl_mod(uvX * uvScale, uvScale);
+    float3 x = textures.SampleLevel(MyLinearRepeatSampler, float3(uvX.x, uvX.y, (float)textureID), 0);
+
+    float2 uvY = float2(obj_p[me.y], obj_p[me.z]);
+    uvY = glsl_mod(uvY * uvScale, uvScale);
+    float3 y = textures.SampleLevel(MyLinearRepeatSampler, float3(uvY.x, uvY.y, (float)textureID), 0);
+
+    //Debug texture mapping
+    // // x = float3(0,0,0);
+    // // y = float3(0,0,0);
+
+    // if(ma.x == 0) x.x = 1.0;
+    // else if(ma.x == 1) x.y =1.0;
+    // else x.z = 1.0;
+
+    // if(me.x == 0) y.x = 1.0;
+    // else if(me.x == 1) y.y =1.0;
+    // else y.z = 1.0;
+
+    float2 w = float2(n[ma.x], n[me.x]);
+    w = clamp((w - 0.5773)/ (1.0 - 0.5773), 0.0, 1.0);
+    w = pow(w, float2(k,k));
+
+    return (x*w.x + y * w.y) / (w.x + w.y);
+}
+
+float3 TextureMap(int textureID, float3 p, float3 objectPosition, int mapType)
+{
+    switch(mapType)
+    {
+        case 0:
+        return CylindricalMap(textureID, p - objectPosition);
+
+        default:
+        case 1:
+        return BoxMap(textureID, p, 8.0f, objectPosition);
+
+        case 2:
+        return BiplanarMap(textureID, p, 1.0f, objectPosition);
+    }
+}
+
 float3 PhongIllumination(float3 ambient, float3 diffuse, float3 specular, float alpha, float3 p, float3 camPos)
 {
     float3 color = ambient * 0.5f;
@@ -369,7 +567,7 @@ float3 PhongIllumination(float3 ambient, float3 diffuse, float3 specular, float 
     return color;
 }
 
-[numthreads(8,8,1)]
+[numthreads(16,16,1)]
 void CSMain (uint3 id : SV_DispatchThreadID)
 {
     uint steps = 0;
@@ -397,8 +595,10 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         if(currentDist <= epsilon){
             float3 hitPoint = ray.origin + ray.dir * currentDist;
             float3 normal = CalculateNormal(hitPoint - ray.dir * epsilon);
-            
-            float3 color = PhongIllumination(AmbientColor, sceneInfo.diffuseColor, float3(1,1,1), sceneInfo.smoothness, hitPoint, camPos);
+                   
+            float3 texturedDiffuse = sceneInfo.textureID == -1 ? sceneInfo.diffuseColor : TextureMap(sceneInfo.textureID, hitPoint, sceneInfo.objectPosition, sceneInfo.mapType);
+
+            float3 color = PhongIllumination(AmbientColor, texturedDiffuse, float3(1,1,1), sceneInfo.smoothness, hitPoint, camPos);
 
             // float3 offsetPos = hitPoint + normal * shadowBias;
             // float3 dirToLight = (positionLight)?normalize(_Light - offsetPos):-_Light;
@@ -414,7 +614,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
             Result[id.xy] = float4(color, 1);
             break;
         }
-        ray.origin += ray.dir * (currentDist* 0.5);
+        ray.origin += ray.dir * (currentDist* 0.7);
         dist += currentDist;
     }
 }
